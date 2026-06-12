@@ -3,7 +3,7 @@
 =====================================
 功能概述：
 1. 从Excel/CSV文件读取股票历史数据（开盘价、最高价、最低价、收盘价）
-2. 使用LSTM（长短期记忆网络）对股票收盘价进行预测
+2. 使用LSTM（长短期记忆网络）对下一天开盘价进行预测
 3. 基于预测信号，使用Backtrader框架进行回测交易
 4. 自动对比不同时间窗口参数的效果，找出最优配置
 
@@ -23,25 +23,15 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout  # LSTM层、全连接�
 import backtrader as bt  # 回测框架
 import re  # 正则表达式，用于数据清洗
 
-# ============================================================
-# 第一部分：Matplotlib 中文显示配置
-# ============================================================
 # 设置中文字体支持，解决图表中文显示乱码问题
 # Windows系统优先使用"微软雅黑"，其次是"黑体"，最后是通用字体
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS"]
 # 解决负号显示为方块的问题
 plt.rcParams["axes.unicode_minus"] = False
 
-# ============================================================
-# 第二部分：交易成本参数配置
-# ============================================================
-# 这些参数用于模拟真实交易中的成本，帮助更准确地估算收益
 COMMISSION_RATE = 0.001   # 交易佣金费率：0.1%（买卖双向收取）
 SLIP_PERC = 0.0005        # 滑点：0.05%（成交价与预期价的差异，防止订单被拒绝）
 
-# ============================================================
-# 第三部分：数据读取与预处理
-# ============================================================
 # 数据文件路径（支持Excel格式）
 file_path = r"C:\Users\czx66\Desktop\我的大学生涯故事\专业课基础课资料\_3.2 智能课程系统设计\测试数据.xsl"
 
@@ -112,11 +102,6 @@ if df.empty:
 print("✅ 读取成功！")
 print("数据条数：", len(df))
 print("时间范围：", df.index.min(), "→", df.index.max())
-# ======================================================================
-
-# ============================================================
-# 第四部分：模型与回测参数配置
-# ============================================================
 """
 参数说明：
 - WINDOW_LIST：时间窗口大小列表，用于LSTM模型lookback
@@ -139,10 +124,6 @@ STOP_LOSS = 0.07                     # 止损：亏损7%时强制卖出
 # 当前使用4个特征：开盘价、最高价、最低价、收盘价
 model_feature_cols = ["open", "high", "low", "close"]
 
-# ============================================================
-# 第五部分：Backtrader回测框架配置
-# ============================================================
-
 # 自定义数据源类：扩展PandasData以支持预测信号列
 # Backtrader默认的PandasData不包含我们需要的预测价格列
 # 这里通过继承并添加pred字段，让策略可以访问预测价格
@@ -157,14 +138,14 @@ class PredictionSignalStrategy(bt.Strategy):
     基于LSTM预测信号的量化交易策略
     
     策略逻辑：
-    1. 每个交易日比较预测价格和当前价格，计算预期收益率
-    2. 如果预期收益率 > 买入阈值，且当前无持仓，则买入
-    3. 如果预期收益率 < -卖出阈值，且当前有持仓，则卖出
+    1. 每个交易日用前一天的预测信号决定交易
+    2. 如果预测下一天开盘价比今天收盘价高，且预期收益>买入阈值，则买入
+    3. 如果预测下一天开盘价比今天收盘价低，且预期亏损>卖出阈值，则卖出
     4. 无论预测如何，达到止盈/止损线时立即平仓
     
     这样的设计可以：
-    - 在市场上涨时及时入场
-    - 在市场下跌时及时离场
+    - 在预测上涨时及时入场
+    - 在预测下跌时及时离场
     - 通过止盈止损控制最大亏损和锁定利润
     """
     
@@ -191,10 +172,10 @@ class PredictionSignalStrategy(bt.Strategy):
         
         执行流程：
         1. 检查是否有待处理订单，如果有则跳过（避免重复交易）
-        2. 获取当前现金、当前价格、预测价格
+        2. 获取当前现金、今天开盘价、今天开盘价的预测值
         3. 验证数据有效性（价格必须为正数且有限）
         4. 如果有持仓，先检查是否触发止盈/止损
-        5. 如果无持仓且满足买入条件，执行买入
+        5. 如果无持仓且满足买入条件，执行买入（用今天开盘价买入）
         6. 如果有持仓且满足卖出条件，执行卖出
         """
         # 如果有待处理订单未完成，本次跳过
@@ -202,22 +183,25 @@ class PredictionSignalStrategy(bt.Strategy):
             return
 
         # 获取当前账户现金和各项价格
-        cash = self.broker.getcash()                      # 可用资金
-        close_price = float(self.data.close[0])           # 当前收盘价
-        pred_price = float(self.data.pred[0])             # LSTM预测价格
+        cash = self.broker.getcash()
+        open_price = float(self.data.open[0])
+        close_price = float(self.data.close[0])
+        pred_price = float(self.data.pred[0])
         
         # 数据有效性检查：价格必须为正且有限
-        if (not np.isfinite(close_price)) or close_price <= 0 or (not np.isfinite(pred_price)):
+        if (not np.isfinite(open_price)) or open_price <= 0 or \
+           (not np.isfinite(close_price)) or close_price <= 0 or \
+           (not np.isfinite(pred_price)):
             return
 
-        # 计算预期收益率：(预测价格 - 当前价格) / 当前价格
-        # 例如：当前100，预测105，则收益率为5%
-        expected_return = pred_price / close_price - 1.0
+        # 计算预期收益率：(预测开盘价 - 实际开盘价) / 实际开盘价
+        # 例如：开盘价100，预测开盘价105，则收益率为5%
+        expected_return = pred_price / open_price - 1.0
         
         # 计算实际买入成本（考虑佣金和滑点）
         # 佣金费率 * 滑点比例 = 额外成本
         # 例如：100 * (1+0.001) * (1+0.0005) = 100.15
-        effective_price = close_price * (1 + COMMISSION_RATE) * (1 + SLIP_PERC)
+        effective_price = open_price * (1 + COMMISSION_RATE) * (1 + SLIP_PERC)
         if effective_price <= 0 or (not np.isfinite(effective_price)):
             return
 
@@ -233,7 +217,7 @@ class PredictionSignalStrategy(bt.Strategy):
                     size = self.position.size
                     if size > 0:
                         print(
-                            f"[止盈卖出] entry={entry_price:.4f} close={close_price:.4f} "
+                            f"[止盈卖出] entry={entry_price:.4f} open={open_price:.4f} "
                             f"pnl={pnl_ratio:.2%} size={size}"
                         )
                         self.pending_order = self.sell(size=size)
@@ -244,7 +228,7 @@ class PredictionSignalStrategy(bt.Strategy):
                     size = self.position.size
                     if size > 0:
                         print(
-                            f"[止损卖出] entry={entry_price:.4f} close={close_price:.4f} "
+                            f"[止损卖出] entry={entry_price:.4f} open={open_price:.4f} "
                             f"pnl={pnl_ratio:.2%} size={size}"
                         )
                         self.pending_order = self.sell(size=size)
@@ -258,7 +242,7 @@ class PredictionSignalStrategy(bt.Strategy):
             if size <= 0:
                 return
             print(
-                f"[买入信号] close={close_price:.4f} pred={pred_price:.4f} "
+                f"[买入信号] open={open_price:.4f} pred={pred_price:.4f} "
                 f"ret={expected_return:.2%} size={size}"
             )
             self.pending_order = self.buy(size=size)
@@ -270,7 +254,7 @@ class PredictionSignalStrategy(bt.Strategy):
             size = self.position.size
             if size > 0:
                 print(
-                    f"[卖出信号] close={close_price:.4f} pred={pred_price:.4f} "
+                    f"[卖出信号] open={open_price:.4f} pred={pred_price:.4f} "
                     f"ret={expected_return:.2%} size={size}"
                 )
                 self.pending_order = self.sell(size=size)
@@ -313,9 +297,6 @@ class PredictionSignalStrategy(bt.Strategy):
         ]:
             self.pending_order = None
 
-# ============================================================
-# 第六部分：实验运行函数
-# ============================================================
 def run_experiment(window):
     """
     运行单次实验：使用指定窗口训练LSTM模型并进行回测
@@ -363,37 +344,36 @@ def run_experiment(window):
     
     # 用训练集拟合归一化器（只使用70%数据）
     train_features = df[model_feature_cols].iloc[:split_point].values
-    train_close = df["close"].iloc[:split_point].values.reshape(-1, 1)
+    train_open = df["open"].iloc[:split_point].values.reshape(-1, 1)
     
     # 检查训练数据是否有效
-    if train_features.shape[0] == 0 or train_close.shape[0] == 0:
+    if train_features.shape[0] == 0 or train_open.shape[0] == 0:
         raise ValueError(
             f"window={window} 时训练集为空：split_point={split_point}, 数据总数={len(df)}。"
         )
     
     # 拟合归一化器：学习数据的min和max
     feature_scaler.fit(train_features)
-    target_scaler.fit(train_close)
+    target_scaler.fit(train_open)  # 目标改为开盘价
 
     # 对所有数据进行归一化（用于后续预测）
     all_features_scaled = feature_scaler.transform(df[model_feature_cols].values)
-    all_close_scaled = target_scaler.transform(df["close"].values.reshape(-1, 1))
+    all_open_scaled = target_scaler.transform(df["open"].values.reshape(-1, 1))
 
     # ============================================================
     # 构建LSTM训练数据（滑动窗口）
     # ============================================================
     # LSTM输入格式：[样本数, 时间步, 特征数]
-    # 例如：window=10, 特征=4，则input_shape=(10, 4)
     X, y, times = [], [], []
     
-    # 滑动窗口遍历：从第window天开始，每天用一个窗口的数据预测下一天
-    for i in range(window, len(df)):
+    # 滑动窗口遍历：从第window天开始，用过去window天预测下一天的开盘价
+    for i in range(window, len(df) - 1):
         # 提取过去window天的特征数据
         X.append(all_features_scaled[i - window : i, :])
-        # 目标：当天收盘价的归一化值
-        y.append(all_close_scaled[i, 0])
-        # 记录对应的日期
-        times.append(df.index[i])
+        # 目标：下一天（i+1）开盘价的归一化值
+        y.append(all_open_scaled[i + 1, 0])
+        # 记录对应的日期（预测的是下一天，所以记录下一天的时间）
+        times.append(df.index[i + 1])
     
     X = np.array(X)
     y = np.array(y)
@@ -416,21 +396,13 @@ def run_experiment(window):
     # ============================================================
     # 构建LSTM神经网络模型
     # ============================================================
-    """
-    模型结构：
-    1. LSTM层（64个单元）：return_sequences=True，因为后面还有LSTM层
-       - 64个神经元，能够捕捉时序数据的长期依赖
-       - Dropout(0.1)防止过拟合，随机丢弃10%的神经元
-    2. LSTM层（32个单元）：最后一层LSTM，不需要return_sequences
-    3. Dense层（1个单元）：输出预测的收盘价
-    """
     model = Sequential([
-        # 第一层LSTM：输入形状为(窗口大小, 特征数量)
+        # 第一层LSTM,输入形状为(窗口大小, 特征数量)
         LSTM(64, return_sequences=True, input_shape=(window, len(model_feature_cols))),
-        Dropout(0.1),  # 随机丢弃10%的神经元，防止过拟合
-        # 第二层LSTM：输出一个序列
+        Dropout(0.1),
+        # 第二层LSTM
         LSTM(32),
-        # 全连接层：输出单个预测值
+        # 全连接层
         Dense(1),
     ])
     model.compile(optimizer="adam", loss="mse")  # Adam优化器，MSE均方误差损失
@@ -532,11 +504,6 @@ def run_experiment(window):
         "df_pred": df_pred,
     }
 
-
-# ============================================================
-# 第七部分：主程序执行
-# ============================================================
-
 # 运行所有窗口大小的实验
 all_results = []
 for w in WINDOW_LIST:
@@ -563,13 +530,8 @@ best_result = all_results[int(result_df.index[0])]
 best_window = best_result["window"]
 print(f"\n✅ 最优窗口（按年化）：window={best_window}")
 
-# ============================================================
-# 第八部分：可视化输出
-# ============================================================
-
 # 使用最优 window 的预测结果绘制对比图
 df_pred_best = best_result["df_pred"]
-
 # 创建图表：真实价格 vs 预测价格
 plt.figure(figsize=(10, 4))  # 设置图表大小：宽10英寸，高4英寸
 plt.plot(df_pred_best.index, df_pred_best["close"], label="真实价")  # 蓝色实线：真实价格
